@@ -1,0 +1,475 @@
+---
+#On définit les règles de workflow pour le pipeline
+workflow:
+  rules:
+    #Si la branche n'est pas "main" et que l'événement n'est pas une demande de fusion, le pipeline ne s'exécute jamais
+    - if: $CI_COMMIT_BRANCH != "main" && $CI_PIPELINE_SOURCE != "merge_request_event"
+      when: never
+    #Dans tous les autres cas, le pipeline s'exécute
+    - when: always
+
+#On définit les variables d'environnement utilisées dans le pipeline
+variables:
+  CLUSTER_NAME: "ThemeEKS"
+  AWS_DEFAULT_REGION: eu-west-3  #Région AWS par défaut
+  TF_DIR: ${CI_PROJECT_DIR}/terraform  #Répertoire des fichiers Terraform
+  STATE_NAME: "${CLUSTER_NAME}-tf"  #Nom de l'état Terraform
+  ADDRESS: "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/terraform/state/${STATE_NAME}"  #URL de l'API GitLab pour stocker l'état Terraform
+  DOCKER_IMAGE: "themetmp1"
+
+#On définit les différentes  étapes (stages) du pipeline
+stages:
+  - build_image
+  - test_image
+  - release_image
+  - build_eks
+  - deploy_eks
+  - deploy_monitoring
+  - deploy_dev
+  - deploy_qa
+  - deploy_prod
+  - destroy_eks
+
+#On définit l'image Docker  par défaut utilisée pour les jobs du pipeline .
+image:
+  name: hashicorp/terraform:light
+  entrypoint: [""]
+
+#On définit les commandes qui s'exécutent avant chaque job
+before_script:
+  - terraform --version  #On vérifie la version de Terraform
+  - export GITLAB_ACCESS_TOKEN=$TOKEN  #On exporte le jeton d'accès GitLab
+  - cd ${TF_DIR}  #On change de répertoire vers le dossier Terraform
+  - terraform init  -reconfigure -backend-config="address=${ADDRESS}" -backend-config="lock_address=${ADDRESS}/lock" -backend-config="unlock_address=${ADDRESS}/lock" -backend-config="username=<UseName>" -backend-config="password=$GITLAB_ACCESS_TOKEN" -backend-config="lock_method=POST" -backend-config="unlock_method=DELETE" -backend-config="retry_wait_min=5"  # Initialise Terraform avec des configurations spécifiques pour le backend
+
+#On définit le job pour construire l'image Docker de  l'application
+theme park:
+  image: docker:latest
+  services:
+    - name: docker:dind
+      alias: docker
+  stage: build_image
+  before_script:
+    - echo "before script" # Empêcher le before script général de démarrer
+  script:
+    - docker build -t theme:latest .  #On construit l'image Docker
+    - docker save theme:latest | gzip > ${DOCKER_IMAGE}.tar.gz #On sauvegarde l'image Docker dans un fichier tar
+  artifacts:
+    paths:
+      - ./${DOCKER_IMAGE}.tar.gz  #On stocke le fichier tar comme artefact
+    when: on_success
+    expire_in: 2 days  #On définit que l'artefact est disponible pendant 2 jours
+  after_script:
+    - docker rmi -f theme:latest
+  
+
+#On définit le job pour créer l'image Docker pour le CI/CD
+image cicd:
+  stage: build_image
+  image: docker:latest
+  services:
+    - name: docker:dind
+      alias: docker
+  before_script:
+    - echo "before script" # Empêcher le before script général de démarrer
+    - docker info
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"  #On se connecte au registre Docker
+  script:
+    - docker build -t kubectl-cicd ./image_cicd  #On construit l'image Docker à partir du répertoire ./image_cicd
+    - docker tag kubectl-cicd "$CI_REGISTRY_IMAGE/terraform-gitlab:latest"  #On tag l'image
+    - docker push "$CI_REGISTRY_IMAGE/terraform-gitlab:latest"  #On push l'image vers le registre Docker
+  rules:
+    - changes: #On lance le job seuelement quand il y a un changement dans le répertoire image_cicd
+      - image_cicd/**
+
+#On définit le job pour tester l'image Docker de l'application
+test:
+  image: docker
+  services:
+     - name: docker:dind
+       alias: docker
+  stage: test_image
+  before_script:
+    - echo "before script" # Empêcher le before script général de démarrer
+  script:
+    - echo "Deploying version $BUILD_VERSION"
+    - docker load < ${DOCKER_IMAGE}.tar.gz # On charge l'image Docker à partir de l'artifact
+    - docker run -it --rm -d  -p 5001:5000 --name themepark theme:latest  #On exécute le conteneur Docker
+    - sleep 5
+    - curl -X GET -i  http://localhost:5001/ride  #On effectue une requête pour tester
+  after_script:
+    - docker stop themepark  #On arrête le conteneur après le test: cette commande est lancé même si le test échoue
+    - docker rmi -f theme:latest
+
+#On définit le job pour publier l'image Docker de l'application
+release-image:
+  image: docker
+  services:
+    - name: docker:dind
+      alias: docker
+  stage: release_image
+  before_script:
+    - echo "before script" # Empêcher le before script général de démarrer
+    - docker info
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"  #On se connecte au registre Docker
+  script:
+    - docker load < ${DOCKER_IMAGE}.tar.gz  #On charge l'image Docker à partir de l'artefact
+    - docker tag "theme:latest" "$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"  #On tag l'image avec le SHA du commit
+    - docker push "$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"  #On push l'image vers le registre
+    - if [ ! -z "$CI_COMMIT_TAG" ]; then docker push "$CI_REGISTRY_IMAGE/themepark:latest"; fi  #Si un autre tag est déjà existant, pusher l'actuel en le définissant comme latest
+  after_script:
+    - docker rmi -f theme:latest "$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    
+ 
+ #-------------------- EKS ---------------------#
+
+
+#On définit les jobs terraform pour gérer l'infrastructure EKS
+1_validate:
+  stage: build_eks
+  script:
+    - echo "Terraform validate"
+    - export TF_VAR_cluster_name=$CLUSTER_NAME
+    - terraform validate  #On valide la configuration Terraform
+  cache:
+    key: ${CI_COMMIT_REF_NAME}
+    paths:
+    - ${TF_DIR}/.terraform
+    policy: push
+
+2_plan:
+  stage: build_eks
+  script:
+    - echo "Terraform plan"
+    - export TF_VAR_cluster_name=$CLUSTER_NAME
+    - terraform plan -out=${CI_PROJECT_DIR}/tfplan #On génère un plan d'exécution Terraform
+  artifacts:
+    paths:
+      - ${CI_PROJECT_DIR}/tfplan  #On stocke le fichier comme artefact
+    expire_in: 1 hour
+  dependencies:
+    - 1_validate
+  cache:
+    key: ${CI_COMMIT_REF_NAME}
+    paths:
+    - ${TF_DIR}/.terraform
+    policy: pull-push
+
+apply:
+  stage: deploy_eks
+  script:
+    - echo "Terraform apply"
+    - export TF_VAR_cluster_name=$CLUSTER_NAME
+    - terraform apply -input=false ${CI_PROJECT_DIR}/tfplan  #On applique les changement Terraform pour créer l'infrastructure EKS
+  dependencies:
+    - 2_plan
+  cache:
+    key: ${CI_COMMIT_REF_NAME}
+    paths:
+    - ${TF_DIR}/.terraform
+    policy: pull-push
+    
+destroy:
+  stage: destroy_eks
+  script:
+    - export TF_VAR_cluster_name=$CLUSTER_NAME
+    - terraform destroy  -auto-approve  #On détruit l'infrastructure EKS
+  dependencies:
+     - 2_plan
+     - apply
+  cache:
+    key: ${CI_COMMIT_REF_NAME}
+    paths:
+    - ${TF_DIR}/.terraform
+    policy: pull-push
+  when: manual  #Job manuel
+    
+
+#On définit les jobs pour déployer et arrêter le monitoring sur EKS
+1_Prometheus:
+  stage: deploy_monitoring
+  environment:
+    name: premetheus_env
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script " # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    #- export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    #- export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    # Installer Prometheus et Grafana
+    - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    - helm upgrade --install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace --set alertmanager.persistentVolume.storageClass="gp2",server.persistentVolume.storeClass="gp2"
+    - sleep 10
+    # Remplacer les types services ClusterIPs en LoadBalancer pour permettre l'accés de puis internet
+    - kubectl patch svc/prometheus-grafana -p '{"spec":{"type":"LoadBalancer"}}' -n monitoring
+    - kubectl patch svc/prometheus-kube-prometheus-prometheus -p '{"spec":{"type":"LoadBalancer"}}' -n monitoring
+    - sleep 10
+    - kubectl get all -n monitoring
+    - kubectl get svc -n monitoring
+    - sleep  20
+    # Extraction de l'URL du service LoadBalancer et construction de l'URL d'accès
+    - export LB_HOST=$(kubectl get svc prometheus-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+    - export APP_URL="http://$LB_HOST:9090"
+    - echo "L'URL d'accès à l'application est $APP_URL"
+    # Récupération de l'ID de l'environnement "promotheus_env" via l'API GitLab
+    - "export ENV_ID=$(curl --silent --header \"PRIVATE-TOKEN: ${GITLAB_API_TOKEN}\" \"https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments?search=premetheus_env\" | jq '.[0].id')"
+    - echo "ID de l'environnement promotheus_env $ENV_ID"
+    # Mise à jour de l'environnement via l'API GitLab avec l'URL calculée
+    - >
+      curl --request PUT "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments/${ENV_ID}" --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" --header "Content-Type: application/json" --data "{\"external_url\":\"${APP_URL}\"}"
+
+  when: manual
+
+2_Grafana:
+  stage: deploy_monitoring
+  environment:
+    name: Grafana_env
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script " # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - kubectl get svc -n monitoring
+    - echo "Display Grafana admin password"
+    - kubectl --namespace monitoring get secrets prometheus-grafana -o jsonpath="{.data.admin-password}" | base64 -d ; echo
+    - sleep  30
+    # Extraction de l'URL du service LoadBalancer et construction de l'URL d'accès
+    - export LB_HOST=$(kubectl get svc prometheus-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+    - export APP_URL="http://$LB_HOST"
+    - echo "L'URL d'accès à l'application est $APP_URL"
+    # Récupération de l'ID de l'environnement "monitor_env" via l'API GitLab
+    - "export ENV_ID=$(curl --silent --header \"PRIVATE-TOKEN: ${GITLAB_API_TOKEN}\" \"https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments?search=Grafana_env\" | jq '.[0].id')"
+    - echo "ID de l'environnement monitor_env $ENV_ID"
+    # Mise à jour de l'environnement via l'API GitLab avec l'URL calculée
+    - >
+      curl --request PUT "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments/${ENV_ID}" --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" --header "Content-Type: application/json" --data "{\"external_url\":\"${APP_URL}\"}"
+  needs:
+    - 1_Prometheus # Empêcher l'activation si deploy-dev n'a pas été un succès 
+    
+
+stop-monitor:
+  stage: deploy_monitoring
+  environment:
+    name: monitor_env
+    action: stop
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script"  # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - sleep 5
+    - helm uninstall prometheus --namespace monitoring
+    - kubectl delete -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    - sleep 30
+    - kubectl get all -n monitoring
+    - kubectl delete namespace monitoring
+    - kubectl get svc --all-namespaces 
+#  needs:
+#    - 2_Grafana # Empêcher l'activation si deploy-dev n'a pas été un succès 
+  when: manual
+
+
+#On définit les jobs pour déployer et arrêter l'application sur EKS
+deploy-dev:
+  stage: deploy_dev
+  environment:
+    name: dev_env
+    on_stop: stop-dev
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script " # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - echo "Contexts"
+    - kubectl config get-contexts  #On affiche la listes des contextes après la commande ci-dessus
+    - echo "IAM User"
+    - aws sts get-caller-identity  #On affiche les infos de l'utilisateur en cour de aws
+    - export NAMESPACE='dev'       #Exporter des valeurs qu'on va inclure dans deployment.yaml
+    - export IMAGE="$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    - kubectl get pod -A #On affiche les pods avant apply
+    - envsubst < deployment.yaml | kubectl apply -f -  #On déploie l'application dans l'environnement de développement
+    - sleep 30
+    - kubectl get all -n dev   #On affiche les objets créés dans EKS
+    - kubectl get svc -n dev   #On affiche les services créés dans EKS
+    - kubectl get pods -n dev  #On affiche les pods 
+    - kubectl get storageclass #On affiche les storageClass EKS
+    - kubectl get pvc -n dev   #On affiche les persistence volume claim
+    - kubectl get pv -n dev    #On affiche les persitence volume.
+    # Extraction de l'URL du service LoadBalancer et construction de l'URL d'accès
+    - export LB_HOST=$(kubectl get svc themepark-service-dev -n dev -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+    - export APP_URL="http://$LB_HOST:5001/ride"
+    - echo "L'URL d'accès à l'application est $APP_URL"
+    # Récupération de l'ID de l'environnement "dev_env" via l'API GitLab
+    - "export ENV_ID=$(curl --silent --header \"PRIVATE-TOKEN: ${GITLAB_API_TOKEN}\" \"https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments?search=dev_env\" | jq '.[0].id')"
+    - echo "ID de l'environnement dev $ENV_ID"
+    # Mise à jour de l'environnement via l'API GitLab avec l'URL calculée
+    - >
+      curl --request PUT "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments/${ENV_ID}" --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" --header "Content-Type: application/json" --data "{\"external_url\":\"${APP_URL}\"}"
+  when: manual
+
+stop-dev:
+  stage: deploy_dev
+  environment:
+    name: dev_env
+    action: stop
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script"  # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - export NAMESPACE='dev'
+    - export IMAGE="$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    - kubectl get pod -A
+    - kubectl get all -n dev  #On affiche les pods sur EKS
+    - envsubst < deployment.yaml | kubectl delete -f -  #On arrête l'application dans l'environnement de développement
+    - sleep 20
+    - kubectl get all -n dev
+  needs:
+    - deploy-dev # Empêcher l'activation si deploy-dev n'a pas été un succès 
+  when: manual
+
+
+deploy-qa:
+  stage: deploy_qa
+  environment:
+    name: qa_env
+    on_stop: stop-qa
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script " # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - echo "Contexts"
+    - kubectl config get-contexts  #On affiche la listes des contextes après la commande ci-dessus
+    - echo "IAM User"
+    - aws sts get-caller-identity  #On affiche les infos de l'utilisateur en cour de aws
+    - export NAMESPACE='qa'       #Exporter des valeurs qu'on va inclure dans deployment.yaml
+    - export IMAGE="$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    - kubectl get pod -A #On affiche les pods avant apply
+    - envsubst < deployment.yaml | kubectl apply -f -  #On déploie l'application dans l'environnement de développement
+    - sleep 30
+    - kubectl get all -n qa   #On affiche les objets créés dans EKS
+    - kubectl get svc -n qa   #On affiche les services créés dans EKS
+    - kubectl get pods -n qa  #On affiche les pods 
+    - kubectl get storageclass #On affiche les storageClass EKS
+    - kubectl get pvc -n qa   #On affiche les persistence volume claim
+    - kubectl get pv -n qa    #On affiche les persitence volume.
+    # Extraction de l'URL du service LoadBalancer et construction de l'URL d'accès
+    - export LB_HOST=$(kubectl get svc themepark-service-qa -n qa -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+    - export APP_URL="http://$LB_HOST:5001/ride"
+    - echo "L'URL d'accès à l'application est $APP_URL"
+    # Récupération de l'ID de l'environnement "dev_env" via l'API GitLab
+    - "export ENV_ID=$(curl --silent --header \"PRIVATE-TOKEN: ${GITLAB_API_TOKEN}\" \"https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments?search=qa_env\" | jq '.[0].id')"
+    - echo "ID de l'environnement dev $ENV_ID"
+    # Mise à jour de l'environnement via l'API GitLab avec l'URL calculée
+    - >
+      curl --request PUT "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments/${ENV_ID}" --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" --header "Content-Type: application/json" --data "{\"external_url\":\"${APP_URL}\"}"
+  when: manual
+
+stop-qa:
+  stage: deploy_qa
+  environment:
+    name: qa_env
+    action: stop
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script"  # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - export NAMESPACE='qa'
+    - export IMAGE="$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    - kubectl get pod -A
+    - kubectl get all -n qa  #On affiche les pods sur EKS
+    - envsubst < deployment.yaml | kubectl delete -f -  #On arrête l'application dans l'environnement de développement
+    - sleep 20
+    - kubectl get all -n qa
+  needs:
+    - deploy-qa # Empêcher l'activation si deploy-dev n'a pas été un succès 
+  when: manual
+
+
+deploy-prod:
+  stage: deploy_prod
+  environment:
+    name: prod_env
+    on_stop: stop-prod
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script"  # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - export NAMESPACE='prod'
+    - export IMAGE="$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    - kubectl get pod -A
+    - envsubst < deployment.yaml | kubectl apply -f -  #On déploie l'application dans l'environnement de production
+    - sleep 30
+    - kubectl get all -n prod  #On affiche les pods de EKS
+   # Extraction de l'URL du service LoadBalancer et construction de l'URL d'accès
+    - export LB_HOST=$(kubectl get svc themepark-service-prod -n prod -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+    - export APP_URL="http://$LB_HOST:5001/ride"
+    - echo "L'URL d'accès à l'application est $APP_URL"
+    # Récupération de l'ID de l'environnement "prod_env" via l'API GitLab
+    - "export ENV_ID=$(curl --silent --header \"PRIVATE-TOKEN: ${GITLAB_API_TOKEN}\" \"https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments?search=prod_env\" | jq '.[0].id')"
+    - echo "ID de l'environnement prod $ENV_ID"
+    # Mise à jour de l'environnement  via l'API GitLab avec l'URL calculée
+    - >
+      curl --request PUT "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/environments/${ENV_ID}" --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" --header "Content-Type: application/json" --data "{\"external_url\":\"${APP_URL}\"}"
+  when: manual
+
+stop-prod:
+  stage: deploy_prod
+  environment:
+    name: prod_env
+    action: stop
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform-gitlab:latest
+  before_script:
+    - echo "before script"  # Empêcher le before script général de démarrer
+  script:
+    - echo "Configuration de kubectl pour se connecter au cluster $CLUSTER_NAME"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_DEFAULT_REGION  #On configure kubectl pour se connecter au cluster EKS
+    - export NAMESPACE='prod'
+    - export IMAGE="$CI_REGISTRY_IMAGE/themepark:${CI_COMMIT_SHORT_SHA}"
+    - kubectl get pod -A
+    - kubectl get all -n prod  #On affiche les pods sur EKS
+    - envsubst < deployment.yaml | kubectl delete -f -  #On arrête l'application dans l'environnement de production
+    - sleep 20
+    - kubectl get all -n prod
+  needs:
+    - deploy-prod # Empêcher l'activation si deploy-prod n'a pas été un succès 
+  when: manual
+

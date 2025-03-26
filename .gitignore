@@ -1,0 +1,4 @@
+/app/.gradle
+/terraform/.terraform
+.terraform.lock.hcl
+

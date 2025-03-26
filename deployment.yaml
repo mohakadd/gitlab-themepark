@@ -1,0 +1,148 @@
+
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+
+---
+kind: PersistentVolume
+apiVersion: v1
+metadata:
+ name: mongo-pv-${NAMESPACE}
+ labels:
+  type: local
+spec:
+ storageClassName: gp2
+ capacity:
+  storage: 500Mi
+ accessModes:
+  - ReadWriteOnce
+ hostPath:
+  path: "/mnt/mongo_data_${NAMESPACE}"
+
+---
+apiVersion: v1
+data:
+  MONGO_INITDB_ROOT_USERNAME: Tmd1cmF5QA==
+  MONGO_INITDB_ROOT_PASSWORD: Tmd1cmF5QA==
+kind: Secret
+metadata:
+  name: mongodb-secrets
+  namespace: ${NAMESPACE}
+type: Opaque
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app: mongo-claim0
+  name: mongo-claim0
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 500Mi
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: mongo
+  name: mongo
+  namespace: ${NAMESPACE}
+spec:
+  serviceName: mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+      - env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secrets
+              key: MONGO_INITDB_ROOT_USERNAME
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secrets
+              key: MONGO_INITDB_ROOT_PASSWORD
+        image: mongo
+        imagePullPolicy: ""
+        name: mongo
+        ports:
+        - containerPort: 27017
+        resources: {}
+        volumeMounts:
+        - mountPath: /data/db
+          name: mongo-claim0
+      restartPolicy: Always
+      serviceAccountName: ""
+      volumes:
+      - name: mongo-claim0
+        persistentVolumeClaim:
+          claimName: mongo-claim0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mongo
+  name: mongo
+  namespace: ${NAMESPACE}
+spec:
+  type: ClusterIP
+  ports:
+  - port: 27017
+    targetPort: 27017
+    protocol: TCP
+  selector:
+    app: mongo
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: themepark
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: themepark-${NAMESPACE}
+  template:
+    metadata:
+      labels:
+        app: themepark-${NAMESPACE}
+    spec:
+      containers:
+        - name: themepark
+          image: ${IMAGE}
+          ports:
+            - containerPort: 5000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: themepark-service-${NAMESPACE}
+  namespace: ${NAMESPACE}
+spec:
+  type: LoadBalancer
+  selector:
+    app: themepark-${NAMESPACE}
+  ports:
+    - port: 5001
+      targetPort: 5000
